@@ -7,18 +7,24 @@ import org.springframework.data.jpa.domain.Specification;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 public class CorporateFileService {
     private final LoggerService loggerService;
     private final BankProgramRepository bankProgramRepository;
     private final MandateRequestRepository mandateRequestRepository;
+    private static final Set<Integer> SUCCESS_STATUSES = Collections.unmodifiableSet(
+            new HashSet<>(Arrays.asList(5)));
+    private static final Set<Integer> PENDING_STATUSES = Collections.unmodifiableSet(
+            new HashSet<>(Arrays.asList(1, 2, 3, 8, 9, 11, 12)));
+    private static final Set<Integer> REJECTED_STATUSES = Collections.unmodifiableSet(
+            new HashSet<>(Arrays.asList(4, 6, 7, 10, 13)));
 
     public CorporateFileService(LoggerService loggerService,
                                 BankProgramRepository bankProgramRepository,
@@ -62,6 +68,7 @@ public class CorporateFileService {
                     .and(MandateRequestSpecification.hasEntityName(entityName))
                     .and(MandateRequestSpecification.hasTspName(tspName))
                     .and(MandateRequestSpecification.hasFileName(mrfileName))
+                    .and(MandateRequestSpecification.hasMrPidIsNull())
                     .and(MasterSpecification.hasDateBetween("createdAt", fromDate, toDate));
 
             if (CommonUtil.checkNotNullEmpty(nachType)) {
@@ -74,99 +81,32 @@ public class CorporateFileService {
             Page<MandateRequest> mandateRequests = mandateRequestRepository.findAll(spec, pageRequest);
 
             List<MandateRequest> mandateRequestList = mandateRequests.getContent();
-            Map<Integer, String> mrIdAndMrFileName = mandateRequestList.stream()
-                    .collect(Collectors.toMap(MandateRequest::getMrId, MandateRequest::getMrFilename));
+            List<Integer> zipMrIds = mandateRequestList.stream()
+                    .map(MandateRequest::getMrId)
+                    .collect(Collectors.toList());
 
-            List<MandateRequest> requestsForCounts = new ArrayList<>(mandateRequestList);
-            if (CommonUtil.checkNotNullEmpty(mrfileName) && !mandateRequestList.isEmpty()) {
-                // When filtering by a zip filename, include child XML records in counts.
-                List<Integer> parentIds = mandateRequestList.stream()
-                        .map(MandateRequest::getMrId)
-                        .collect(Collectors.toList());
-                Specification<MandateRequest> childSpec = (root, query, cb) -> root.get("mrPid").in(parentIds);
-                List<MandateRequest> childRequests = mandateRequestRepository.findAll(childSpec);
+            Map<Integer, List<MandateRequest>> mrPIdAgainstList = zipMrIds.isEmpty()
+                    ? Collections.emptyMap()
+                    : mandateRequestRepository.findByMrPidIn(zipMrIds)
+                            .stream()
+                            .collect(Collectors.groupingBy(MandateRequest::getMrPid)); // xml records
 
-                Set<Integer> seenIds = new HashSet<>(parentIds);
-                for (MandateRequest child : childRequests) {
-                    if (seenIds.add(child.getMrId())) {
-                        requestsForCounts.add(child);
-                    }
-                }
-            }
-
-            Map<Integer, List<MandateRequest>> mrPIdAgainstList = requestsForCounts.stream().filter(mr -> mr.getMrPid() != null)
-                    .collect(Collectors.groupingBy(MandateRequest::getMrPid));//xml records
-
-            List<PhysicalCorporateFileDto> physicalCorporateDtos = new ArrayList<>();
+            List<PhysicalCorporateFileDto> physicalCorporateDtos = new ArrayList<>(mandateRequestList.size());
             for (MandateRequest req : mandateRequestList) {
-                PhysicalCorporateFileDto corporateDto = new PhysicalCorporateFileDto();
-                if (mrPIdAgainstList.containsKey(req.getMrId())) {
-                    corporateDto.setTspName(req.getTspLinkHdr().getTspName());
-                    corporateDto.setEntityName(req.getCorporateEntityHdr() != null
-                            ? req.getCorporateEntityHdr().getCeName()
-                            : "");
-                    corporateDto.setLastUpdatedAt(DateUtil.formatToReadableDate(req.getUpdatedAt()));
+                PhysicalCorporateFileDto dto = new PhysicalCorporateFileDto();
+                populateCommonFields(dto, req);
 
-                    corporateDto.setTotalCount(mrPIdAgainstList.get(req.getMrId()).size());
-                    corporateDto.setMrNachType((int) req.getMrNachType());
-                    corporateDto.setSuccessCount((int) mrPIdAgainstList.get(req.getMrId()).stream().
-                            filter(mrReq -> mrReq.getMrStatus() == 5).count());
+                List<MandateRequest> childRequests = mrPIdAgainstList.get(req.getMrId());
+                List<MandateRequest> mandateRequestListForCounts = childRequests != null
+                        ? childRequests
+                        : Collections.singletonList(req);
 
-                    corporateDto.setPendingCount((int) mrPIdAgainstList.get(req.getMrId()).stream()
-                            .filter(txn -> txn.getMrStatus() == 1 // New Request
-                                           || txn.getMrStatus() == 2 // Request Send to NPCI
-                                           || txn.getMrStatus() == 3 // INP-ACK received
-                                           || txn.getMrStatus() == 8 // Pending Checker Approval
-                                           || txn.getMrStatus() == 9 // Approved by Checker
-                                           || txn.getMrStatus() == 11 // Pending Checker-Reviewer Approval
-                                           || txn.getMrStatus() == 12) // Approved by Checker-Reviewer
-                            .count());
-
-                    corporateDto.setRejectedCount((int) mrPIdAgainstList.get(req.getMrId()).stream()
-                            .filter(mandateRequest -> mandateRequest.getMrStatus() == 4 // Rejected by NPCI
-                                                      || mandateRequest.getMrStatus() == 6 // Rejected By Destination Bank
-                                                      || mandateRequest.getMrStatus() == 7 // Rejected by SB
-                                                      || mandateRequest.getMrStatus() == 10 // Rejected By Checker
-                                                      || mandateRequest.getMrStatus() == 13) // Rejected By Checker-Reviewer
-                            .count());
-
-                    corporateDto.setFileName(mrIdAndMrFileName.get(req.getMrId()));
-                    corporateDto.setMrpId(req.getMrId());
-                    physicalCorporateDtos.add(corporateDto);
-                } else {
-                    if (req.getMrPid() == null) {
-                        corporateDto.setTspName(req.getTspLinkHdr().getTspName());
-                        corporateDto.setEntityName(req.getCorporateEntityHdr() != null
-                                ? req.getCorporateEntityHdr().getCeName()
-                                : "");
-                        corporateDto.setLastUpdatedAt(DateUtil.formatToReadableDate(req.getUpdatedAt()));
-
-                        corporateDto.setTotalCount(Stream.of(req).toList().size());
-                        corporateDto.setMrNachType((int) req.getMrNachType());
-                        corporateDto.setSuccessCount((int) Stream.of(req).
-                                filter(mrReq -> mrReq.getMrStatus() == 5).count());
-
-                        corporateDto.setPendingCount((int) Stream.of(req).filter(mandateRequest -> mandateRequest.getMrStatus() == 1 // New Request
-                                                                                                   || mandateRequest.getMrStatus() == 2 // Request Send to NPCI0
-                                                                                                   || mandateRequest.getMrStatus() == 3 // INP-ACK received
-                                                                                                   || mandateRequest.getMrStatus() == 8 // Pending Checker Approval
-                                                                                                   || mandateRequest.getMrStatus() == 9 // Approved by Checker
-                                                                                                   || mandateRequest.getMrStatus() == 11 // Pending Checker-Reviewer Approval
-                                                                                                   || mandateRequest.getMrStatus() == 12) // Approved by Checker-Reviewer
-                                .count());
-
-                        corporateDto.setRejectedCount((int) Stream.of(req).
-                                filter(mandateRequest -> mandateRequest.getMrStatus() == 4 // Rejected by NPCI
-                                                         || mandateRequest.getMrStatus() == 6 // Rejected By Destination Bank
-                                                         || mandateRequest.getMrStatus() == 7 // Rejected by SB
-                                                         || mandateRequest.getMrStatus() == 10 // Rejected By Checker
-                                                         || mandateRequest.getMrStatus() == 13) // Rejected By Checker-Reviewer
-                                .count());
-
-                        corporateDto.setFileName(req.getMrFilename());
-                        physicalCorporateDtos.add(corporateDto);
-                    }
+                dto.setFileName(req.getMrFilename());
+                if (childRequests != null) {
+                    dto.setMrpId(req.getMrId());
                 }
+                populateCounts(dto, mandateRequestListForCounts);
+                physicalCorporateDtos.add(dto);
             }
             loggerService.info("Returning corporate file", "getCorporateFileList", "");
             return new PageImpl<>(physicalCorporateDtos, pageRequest, mandateRequests.getTotalElements());
@@ -174,5 +114,37 @@ public class CorporateFileService {
             loggerService.error("Error fetching corporate file", "getCorporateFileList", e.getMessage());
             throw new ServiceException(e.getMessage());
         }
+    }
+
+    private void populateCommonFields(PhysicalCorporateFileDto dto, MandateRequest req) {
+        dto.setTspName(Optional.ofNullable(req.getTspLinkHdr())
+                .map(TspLinkHdr::getTspName)
+                .orElse(""));
+        dto.setEntityName(req.getCorporateEntityHdr() != null
+                ? req.getCorporateEntityHdr().getCeName()
+                : "");
+        dto.setLastUpdatedAt(DateUtil.formatToReadableDate(req.getUpdatedAt()));
+        dto.setMrNachType((int) req.getMrNachType());
+    }
+
+    private void populateCounts(PhysicalCorporateFileDto dto, List<MandateRequest> requests) {
+        int success = 0;
+        int pending = 0;
+        int rejected = 0;
+
+        for (MandateRequest mr : requests) {
+            int status = mr.getMrStatus();
+            if (SUCCESS_STATUSES.contains(status)) {
+                success++;
+            } else if (PENDING_STATUSES.contains(status)) {
+                pending++;
+            } else if (REJECTED_STATUSES.contains(status)) {
+                rejected++;
+            }
+        }
+        dto.setTotalCount(requests.size());
+        dto.setSuccessCount(success);
+        dto.setPendingCount(pending);
+        dto.setRejectedCount(rejected);
     }
 }
